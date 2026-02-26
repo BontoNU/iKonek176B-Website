@@ -1,0 +1,636 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\Payment;
+use App\Models\DocumentRequest;
+use App\Models\PaymentMethod;
+use App\Models\DocumentType; 
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Str;
+use Illuminate\Support\Facades\DB;
+use Inertia\Inertia;
+use Illuminate\Support\Facades\Storage;
+use Carbon\Carbon;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Validation\Rule;
+
+class PaymentController extends Controller
+{
+    /**
+     * Helper method to format receipt image URL from receipt_content
+     */
+    private function formatReceiptImageUrl($receiptContent)
+    {
+        if (empty($receiptContent)) {
+            return null;
+        }
+
+        // If it's already a full URL (http/https), use as-is (for backward compatibility)
+        if (Str::startsWith($receiptContent, ['http://', 'https://'])) {
+            return $receiptContent;
+        } 
+        // If it starts with '/storage/', it's already a URL path, use asset()
+        elseif (Str::startsWith($receiptContent, '/storage/')) {
+            return asset($receiptContent);
+        }
+        // If it's a relative path (e.g., "payments/filename.jpg") - this is the new format
+        else {
+            // Convert relative path to asset URL
+            return asset('storage/' . ltrim($receiptContent, '/'));
+        }
+    }
+
+    /**
+     * Store a simulated payment (called by the frontend when QR "scanned")
+     */
+    public function store(Request $request)
+    {
+        $data = $request->validate([
+            'fk_doc_request_id' => 'required|integer',
+            'fk_user_id' => 'nullable|integer',
+            'request_reference_ticket' => 'nullable|string',
+            'paid_amount' => 'nullable|numeric',
+            'fk_pay_method_id' => 'nullable|integer',
+            'gateway' => 'nullable|string',
+            'client_note' => 'nullable|string',
+            'create_receipt' => 'nullable|boolean',
+            'onsite' => 'nullable|boolean',
+            'transaction_ref' => 'nullable|string', // optional client-provided transaction ref
+            'evidence' => 'nullable|file|mimes:jpg,jpeg,png,webp|max:5120', // optional file up to 5MB
+            'receipt_content' => 'nullable|file|mimes:jpg,jpeg,png,webp|max:5120', // optional file up to 5MB (alternative key name)
+        ]);
+
+        $docReq = DocumentRequest::find($data['fk_doc_request_id']);
+        if (! $docReq) {
+            return response()->json(['message' => 'Document request not found'], 404);
+        }
+
+        // prefer paid_amount (client) otherwise fallback to processing_fee on the document request
+        $amount = isset($data['paid_amount']) && $data['paid_amount'] !== null
+            ? (float)$data['paid_amount']
+            : $docReq->processing_fee;
+
+        if ($amount === null) {
+            return response()->json(['message' => 'No processing fee available for this request'], 422);
+        }
+
+        $isOnsite = $request->boolean('onsite');
+
+        $payMethodId = null;
+        $transactionRef = null;
+
+        if ($isOnsite) {
+            $pm = PaymentMethod::whereRaw('LOWER(pay_method_name) LIKE ?', ['%onsite%'])->first();
+            if (! $pm) {
+                $pm = PaymentMethod::create(['pay_method_name' => 'Onsite']);
+            }
+            $payMethodId = $pm->pay_method_id;
+            $transactionRef = null;
+        } else {
+            $payMethodId = $data['fk_pay_method_id'] ?? null;
+
+            if (empty($payMethodId) && !empty($data['gateway'])) {
+                $gatewayName = trim($data['gateway']);
+                $pm = PaymentMethod::whereRaw('LOWER(pay_method_name) = ?', [strtolower($gatewayName)])->first();
+                if (! $pm) {
+                    $pm = PaymentMethod::where('pay_method_name', 'LIKE', '%' . $gatewayName . '%')->first();
+                }
+                if ($pm) {
+                    $payMethodId = $pm->pay_method_id;
+                } else {
+                    $pm = PaymentMethod::create(['pay_method_name' => $gatewayName]);
+                    $payMethodId = $pm->pay_method_id;
+                }
+            }
+
+            if (empty($payMethodId)) {
+                $defaultName = 'Manual';
+                $pm = PaymentMethod::whereRaw('LOWER(pay_method_name) = ?', [strtolower($defaultName)])->first();
+                if (! $pm) {
+                    $pm = PaymentMethod::create(['pay_method_name' => $defaultName]);
+                }
+                $payMethodId = $pm->pay_method_id;
+            }
+
+            $transactionRef = !empty($data['transaction_ref'])
+                ? $data['transaction_ref']
+                : 'SIM-' . strtoupper(Str::random(8)) . '-' . time();
+        }
+
+        try {
+            $result = DB::transaction(function () use ($docReq, $amount, $payMethodId, $transactionRef, $data, $isOnsite, $request) {
+
+                // Check if there's an existing PENDING payment for this document request
+                $existingPayment = Payment::where('fk_doc_request_id', $docReq->doc_request_id)
+                    ->where('status', 'PENDING')
+                    ->first();
+
+                $receiptContent = null;
+                // Check for file upload with either 'evidence' or 'receipt_content' key
+                $fileKey = null;
+                
+                // Log all file inputs for debugging
+                \Log::info('Checking for payment file upload', [
+                    'has_evidence' => $request->hasFile('evidence'),
+                    'has_receipt_content' => $request->hasFile('receipt_content'),
+                    'all_files' => array_keys($request->allFiles()),
+                    'doc_request_id' => $docReq->doc_request_id,
+                ]);
+                
+                if ($request->hasFile('evidence') && $request->file('evidence')->isValid()) {
+                    $fileKey = 'evidence';
+                } elseif ($request->hasFile('receipt_content') && $request->file('receipt_content')->isValid()) {
+                    $fileKey = 'receipt_content';
+                }
+                
+                if ($fileKey) {
+                    $file = $request->file($fileKey);
+                    $path = $file->store('payments', 'public');
+                    
+                    // Log the storage path for debugging
+                    \Log::info('Payment evidence uploaded', [
+                        'file_key' => $fileKey,
+                        'original_name' => $file->getClientOriginalName(),
+                        'mime_type' => $file->getMimeType(),
+                        'size' => $file->getSize(),
+                        'path' => $path,
+                        'file_exists' => Storage::disk('public')->exists($path),
+                        'full_path' => storage_path('app/public/' . $path),
+                    ]);
+                    
+                    // Store just the relative path (e.g., "payments/filename.jpg")
+                    // This ensures consistent URL generation regardless of APP_URL changes
+                    $receiptContent = $path;
+                    
+                    \Log::info('Receipt content stored', ['receipt_content' => $receiptContent]);
+                } else {
+                    \Log::warning('No valid file upload found for payment', [
+                        'has_evidence' => $request->hasFile('evidence'),
+                        'has_receipt_content' => $request->hasFile('receipt_content'),
+                        'evidence_valid' => $request->hasFile('evidence') ? $request->file('evidence')->isValid() : false,
+                        'receipt_content_valid' => $request->hasFile('receipt_content') ? $request->file('receipt_content')->isValid() : false,
+                    ]);
+                }
+
+                // If existing payment found, update it instead of creating a new one
+                if ($existingPayment) {
+                    // Delete old receipt file if it exists and we're uploading a new one
+                    if ($receiptContent && $existingPayment->receipt_content) {
+                        // receipt_content now stores relative path, so use it directly
+                        $oldPath = $existingPayment->receipt_content;
+                        // Handle old format that might have /storage/ prefix
+                        if (Str::startsWith($oldPath, '/storage/')) {
+                            $oldPath = str_replace('/storage/', '', $oldPath);
+                        }
+                        if ($oldPath && Storage::disk('public')->exists($oldPath)) {
+                            Storage::disk('public')->delete($oldPath);
+                        }
+                    }
+
+                    // Update existing payment with new payment method and evidence
+                    $existingPayment->fk_pay_method_id = $payMethodId;
+                    $existingPayment->paid_amount = $amount;
+                    $existingPayment->updated_at = now();
+                    
+                    // Handle transaction_ref: if onsite, set to null; if online, use provided or generate one
+                    if ($isOnsite) {
+                        $existingPayment->transaction_ref = null;
+                    } else {
+                        // For online payments, use provided transaction_ref or generate one if not provided
+                        $existingPayment->transaction_ref = $transactionRef;
+                    }
+                    
+                    // Update receipt_content if new evidence is uploaded
+                    if ($receiptContent) {
+                        $existingPayment->receipt_content = $receiptContent;
+                    }
+                    
+                    $existingPayment->save();
+
+                    return ['payment' => $existingPayment, 'updated' => true];
+                }
+
+                // Create new payment if no existing PENDING payment found
+                $payment = Payment::create([
+                    'fk_doc_request_id' => $docReq->doc_request_id,
+                    'fk_user_id' => Auth::id() ?? ($data['fk_user_id'] ?? null),
+                    'request_reference_ticket' => $data['request_reference_ticket'] ?? $docReq->doc_request_ticket ?? null,
+                    'paid_amount' => $amount,
+                    'fk_pay_method_id' => $payMethodId,
+                    'transaction_ref' => $isOnsite ? null : $transactionRef,
+                    // model's fillable includes receipt_content
+                    'receipt_content' => $receiptContent,
+                    'status' => 'PENDING',
+                    'fk_treasurer_id' => null,
+                    'paid_at' => null,
+                    'handled_at' => null,
+                    'updated_at' => now(),
+                ]);
+
+                return ['payment' => $payment, 'updated' => false];
+            });
+
+            $paymentMethods = PaymentMethod::all(['pay_method_id', 'pay_method_name']);
+
+            $message = $result['updated'] 
+                ? 'Payment record updated successfully' 
+                : 'Payment record created';
+
+            // Format the payment response to include receiptImage URL
+            $paymentData = $result['payment']->toArray();
+            $paymentData['receiptImage'] = $this->formatReceiptImageUrl($result['payment']->receipt_content);
+            
+            \Log::info('Payment store response', [
+                'payment_id' => $result['payment']->payment_id,
+                'receipt_content' => $result['payment']->receipt_content,
+                'receiptImage' => $paymentData['receiptImage'],
+            ]);
+
+            return response()->json([
+                'message' => $message,
+                'payment' => $paymentData,
+                'payment_methods' => $paymentMethods,
+            ], 201);
+        } catch (\Throwable $e) {
+            \Log::error('Payment creation/update failed: ' . $e->getMessage());
+            return response()->json(['message' => 'Failed to create/update payment', 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Index - fetch payments for the Treasurer view
+     */
+    public function index(Request $request)
+    {
+        // Load payments and eager load relations we need
+        // Only show PENDING payments - approved/rejected payments disappear from view
+        $payments = Payment::with([
+            'paymentMethod',
+            'user.credential',
+            'documentRequest.documentType'
+        ])
+        ->where('status', 'PENDING')
+        ->orderBy('payment_id', 'desc')
+        ->get();
+
+        // Map into the shape expected by the frontend
+        $mapped = $payments->map(function ($p) {
+            // Requestor name
+            $requestor = $p->user?->name
+                ?? trim(($p->user?->first_name ?? '') . ' ' . ($p->user?->last_name ?? ''))
+                ?? 'Unknown User';
+
+            // Document
+            $document = $p->documentRequest->doc_request_ticket
+                ?? $p->reference_ticket
+                ?? 'N/A';
+
+            // Document type
+            $documentTypeName = null;
+            if (!empty($p->documentRequest?->documentType?->document_name)) {
+                $documentTypeName = $p->documentRequest->documentType->document_name;
+            } else {
+                $documentTypeName = $p->documentRequest->document_type
+                    ?? $p->documentRequest->doc_type
+                    ?? $p->documentRequest->request_type
+                    ?? 'N/A';
+            }
+
+            // Amount
+            $amount = (float) ($p->paid_amount ?? $p->amount ?? 0.0);
+
+            // Date to display & ISO - use updated_at for submission date (since created_at doesn't exist)
+            $dateObj = $p->updated_at ?? $p->paid_at ?? $p->handled_at ?? null;
+            if ($dateObj instanceof \DateTime || $dateObj instanceof Carbon) {
+                $dateDisplay = $dateObj->format('m/d/Y');
+                $dateIso = $dateObj->toDateTimeString();
+            } else {
+                $dateDisplay = now()->format('m/d/Y');
+                $dateIso = now()->toDateTimeString();
+            }
+            
+            // Payment status
+            $status = strtoupper(trim($p->status ?? 'PENDING'));
+
+            // Profile image
+            $profileImg = $p->user?->profile_pic ?? '/assets/DEFAULT.jpg';
+            if ($profileImg && !Str::startsWith($profileImg, ['http://', 'https://', '/'])) {
+                $profileImg = asset('storage/' . ltrim($profileImg, '/'));
+            } elseif (empty($profileImg)) {
+                $profileImg = '/assets/DEFAULT.jpg';
+            }
+            
+            // User role
+            $roleId = $p->user?->fk_role_id ?? $p->user?->role_id ?? 1;
+            $roleName = match($roleId) {
+                1 => 'Resident',
+                2 => 'Barangay Captain',
+                3 => 'Barangay Secretary',
+                4 => 'Barangay Treasurer',
+                5 => 'Barangay Kagawad',
+                6 => 'SK Chairman',
+                7 => 'Sangguniang Kabataan Kagawad',
+                9 => 'System Admin',
+                default => 'Resident',
+            };
+
+            // Payment method name normalization
+            $rawMethod = trim($p->paymentMethod?->pay_method_name ?? '');
+            $upper = strtoupper($rawMethod);
+            if (str_contains($upper, 'GCASH')) {
+                $payMethodName = 'GCASH';
+            } elseif (str_contains($upper, 'MAYA')) {
+                $payMethodName = 'MAYA';
+            } elseif (str_contains($upper, 'CASH')) {
+                $payMethodName = 'CASH';
+            } elseif (str_contains($upper, 'ONSITE') || str_contains($upper, 'ON-SITE') || str_contains($upper, 'ON SITE')) {
+                $payMethodName = 'ONSITE';
+            } else {
+                $payMethodName = $upper !== '' ? $upper : 'ONSITE';
+            }
+
+            // Contact
+            $contact = $p->user?->credential?->contact_number
+                ?? $p->user?->contact_number
+                ?? 'N/A';
+
+            // Address
+            $address = $p->user?->address
+                ?? $p->documentRequest->address
+                ?? 'N/A';
+
+            // Transaction id
+            $transactionId = $p->transaction_ref
+                ?? ($p->gateway_response['transaction_id'] ?? null)
+                ?? 'N/A';
+
+            // Payment time (friendly)
+            $paymentTime = $p->paid_at?->format('m/d/Y h:i A')
+                ?? ($p->gateway_response['timestamp'] ?? null)
+                ?? 'N/A';
+
+            // ====== Receipt image URL handling ======
+            // receipt_content now stores the relative path (e.g., "payments/filename.jpg")
+            // We need to convert it to a proper asset URL for the frontend
+            $receiptImage = null;
+
+            // Use helper method to format receipt image URL
+            $receiptImage = $this->formatReceiptImageUrl($p->receipt_content ?? $p->receipt_path ?? null);
+            
+            // Log for debugging - log all payments to see what's happening
+            \Log::info('Processing receipt_content for payment', [
+                'payment_id' => $p->payment_id,
+                'receipt_content' => $p->receipt_content,
+                'receipt_path' => $p->receipt_path ?? null,
+                'file_exists' => $p->receipt_content ? Storage::disk('public')->exists($p->receipt_content) : false,
+                'receipt_image_url' => $receiptImage,
+                'payment_method' => $p->paymentMethod?->pay_method_name ?? null,
+            ]);
+
+            return [
+                'id' => $p->payment_id,
+                'requestor' => $requestor,
+                'document' => $document,
+                'documentType' => $documentTypeName,
+                'amount' => $amount,
+                'date' => $dateDisplay,
+                'date_iso' => $dateIso,
+                'paymentMethod' => $payMethodName,
+                'contact' => $contact,
+                'address' => $address,
+                'transactionId' => $transactionId,
+                'paymentTime' => $paymentTime,
+                'receiptImage' => $receiptImage,
+                'status' => $status,
+                'profileImg' => $profileImg,
+            ];
+        });
+
+        $paymentMethods = PaymentMethod::all(['pay_method_id', 'pay_method_name']);
+
+        return Inertia::render('Admin/Treasurer/T_View_Payment', [
+            'payments' => $mapped->values(),
+            'payment_methods' => $paymentMethods,
+        ]);
+    }
+
+
+    public function updateStatus(Request $request, $paymentId)
+    {
+        $data = $request->validate([
+            'status' => ['required', 'string', Rule::in(['APPROVED', 'REJECTED', 'approved', 'rejected', 'Approved', 'Rejected'])],
+            'notes' => 'nullable|string',
+        ]);
+
+        // Normalize status to uppercase
+        $status = strtoupper($data['status']);
+
+        try {
+            $payment = Payment::where('payment_id', $paymentId)->firstOrFail();
+
+            // Only allow changes if current status is PENDING (optional protective check)
+            // Remove or adjust this check if you want to allow re-handling
+            if (strtoupper($payment->status) !== 'PENDING') {
+                // Return Inertia response instead of JSON to avoid Inertia error
+                return back()->withErrors([
+                    'payment_status' => 'Payment is not in a pending state. It has already been ' . $payment->status . '.'
+                ]);
+            }
+
+            // Set common fields
+            $payment->status = $status;
+            $payment->fk_treasurer_id = Auth::id() ?? $payment->fk_treasurer_id;
+            $payment->handled_at = now();
+
+            if ($status === 'APPROVED') {
+                // mark as paid
+                $payment->paid_at = now();
+            } elseif ($status === 'REJECTED') {
+                // ensure paid_at is null when rejected (optional)
+                $payment->paid_at = null;
+            }
+
+            $payment->save();
+
+            // Return Inertia redirect instead of JSON to avoid Inertia error
+            return back()->with('success', 'Payment status updated successfully.');
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return back()->withErrors(['payment' => 'Payment not found']);
+        } catch (\Throwable $e) {
+            \Log::error('Failed to update payment status: ' . $e->getMessage());
+            return back()->withErrors(['payment' => 'Failed to update payment status. Please try again.']);
+        }
+    }
+
+    /**
+     * History - fetch approved/rejected payments for the Treasurer history view
+     */
+    public function history(Request $request)
+    {
+        // Load payments that are APPROVED or REJECTED (not PENDING)
+        $payments = Payment::with([
+            'paymentMethod',
+            'user.credential',
+            'documentRequest.documentType',
+            'treasurer'
+        ])
+        ->whereIn('status', ['APPROVED', 'REJECTED'])
+        ->orderBy('handled_at', 'desc')
+        ->orderBy('payment_id', 'desc')
+        ->get();
+
+        // Map into the shape expected by the frontend
+        $mapped = $payments->map(function ($p) {
+            // Requestor name
+            $requestor = $p->user?->name
+                ?? trim(($p->user?->first_name ?? '') . ' ' . ($p->user?->last_name ?? ''))
+                ?? 'Unknown User';
+
+            // Document
+            $document = $p->documentRequest->doc_request_ticket
+                ?? $p->reference_ticket
+                ?? 'N/A';
+
+            // Document type
+            $documentTypeName = null;
+            if (!empty($p->documentRequest?->documentType?->document_name)) {
+                $documentTypeName = $p->documentRequest->documentType->document_name;
+            } else {
+                $documentTypeName = $p->documentRequest->document_type
+                    ?? $p->documentRequest->doc_type
+                    ?? $p->documentRequest->request_type
+                    ?? 'N/A';
+            }
+
+            // Amount
+            $amount = (float) ($p->paid_amount ?? $p->amount ?? 0.0);
+
+            // Date to display - use handled_at (when treasurer processed it) or paid_at
+            $dateObj = $p->handled_at ?? $p->paid_at ?? $p->updated_at ?? null;
+            if ($dateObj instanceof \DateTime || $dateObj instanceof Carbon) {
+                $dateDisplay = $dateObj->format('m/d/Y');
+                $dateIso = $dateObj->toDateTimeString();
+            } else {
+                $dateDisplay = now()->format('m/d/Y');
+                $dateIso = now()->toDateTimeString();
+            }
+            
+            // Payment status
+            $status = strtoupper(trim($p->status ?? 'PENDING'));
+
+            // Payment method name normalization
+            $rawMethod = trim($p->paymentMethod?->pay_method_name ?? '');
+            $upper = strtoupper($rawMethod);
+            if (str_contains($upper, 'GCASH')) {
+                $payMethodName = 'GCASH';
+                $methodKey = 'online';
+            } elseif (str_contains($upper, 'MAYA')) {
+                $payMethodName = 'MAYA';
+                $methodKey = 'online';
+            } elseif (str_contains($upper, 'CASH')) {
+                $payMethodName = 'CASH';
+                $methodKey = 'onsite';
+            } elseif (str_contains($upper, 'ONSITE') || str_contains($upper, 'ON-SITE') || str_contains($upper, 'ON SITE')) {
+                $payMethodName = 'ONSITE';
+                $methodKey = 'onsite';
+            } else {
+                $payMethodName = $upper !== '' ? $upper : 'ONSITE';
+                $methodKey = 'onsite';
+            }
+
+            // Transaction ID (use for Payment No.) - for onsite with no transaction_ref, use PAY-{id}
+            $transactionId = $p->transaction_ref
+                ?? ($p->gateway_response['transaction_id'] ?? null)
+                ?? ('PAY-' . $p->payment_id);
+
+            // Receipt image URL - use helper method for consistency
+            $receiptImage = $this->formatReceiptImageUrl($p->receipt_content ?? $p->receipt_path ?? null);
+
+            // Profile image
+            $profileImg = $p->user?->profile_pic ?? '/assets/DEFAULT.jpg';
+            if ($profileImg && !Str::startsWith($profileImg, ['http://', 'https://', '/'])) {
+                $profileImg = asset('storage/' . ltrim($profileImg, '/'));
+            } elseif (empty($profileImg) || $profileImg === '/assets/DEFAULT.jpg') {
+                $profileImg = '/assets/DEFAULT.jpg';
+            }
+            
+            // User role
+            $roleId = $p->user?->fk_role_id ?? $p->user?->role_id ?? 1;
+            $roleName = match($roleId) {
+                1 => 'Resident',
+                2 => 'Barangay Captain',
+                3 => 'Barangay Secretary',
+                4 => 'Barangay Treasurer',
+                5 => 'Barangay Kagawad',
+                6 => 'SK Chairman',
+                7 => 'Sangguniang Kabataan Kagawad',
+                9 => 'System Admin',
+                default => 'Resident',
+            };
+
+            // Contact
+            $contact = $p->user?->credential?->contact_number
+                ?? $p->user?->contact_number
+                ?? $p->documentRequest?->contact_number
+                ?? 'N/A';
+
+            // Address - construct from document request fields or use user address
+            $address = 'N/A';
+            if ($p->documentRequest) {
+                $addressParts = [];
+                if (!empty($p->documentRequest->house_number)) {
+                    $addressParts[] = $p->documentRequest->house_number;
+                }
+                if (!empty($p->documentRequest->phase)) {
+                    $addressParts[] = 'Phase ' . $p->documentRequest->phase;
+                }
+                if (!empty($p->documentRequest->package)) {
+                    $addressParts[] = 'Package ' . $p->documentRequest->package;
+                }
+                if (!empty($addressParts)) {
+                    $address = implode(', ', $addressParts);
+                } elseif (!empty($p->documentRequest->address)) {
+                    $address = $p->documentRequest->address;
+                } elseif (!empty($p->user?->address)) {
+                    $address = $p->user->address;
+                }
+            } elseif (!empty($p->user?->address)) {
+                $address = $p->user->address;
+            }
+
+            // Treasurer name (who approved the payment)
+            $treasurerName = $p->treasurer?->name
+                ?? trim(($p->treasurer?->first_name ?? '') . ' ' . ($p->treasurer?->last_name ?? ''))
+                ?? 'N/A';
+
+            return [
+                'id' => $p->payment_id,
+                'payment_no' => $transactionId, // Use transaction ID as payment number
+                'name' => $requestor,
+                'doc_type' => $documentTypeName,
+                'document' => $document,
+                'amount' => $amount,
+                'date' => $dateDisplay,
+                'date_iso' => $dateIso,
+                'method' => $methodKey,
+                'paymentMethod' => $payMethodName,
+                'status' => $status,
+                'receiptImage' => $receiptImage,
+                'transactionId' => $transactionId,
+                'paymentTime' => $p->handled_at?->format('m/d/Y h:i A') ?? $p->paid_at?->format('m/d/Y h:i A') ?? 'N/A',
+                'profileImg' => $profileImg,
+                'role' => $roleName,
+                'roleId' => $roleId,
+                'contact' => $contact,
+                'address' => $address,
+                'treasurerName' => $treasurerName,
+            ];
+        });
+
+        return Inertia::render('Admin/Treasurer/T_History', [
+            'payments' => $mapped->values(),
+        ]);
+    }
+}
